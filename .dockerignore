@@ -1,0 +1,12 @@
+.git
+.venv
+data
+notebooks
+outputs*
+dep
+*.ipynb
+*.png
+*.tiff
+*.JPG
+*.jpg
+__pycache__

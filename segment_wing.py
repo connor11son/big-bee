@@ -99,10 +99,12 @@ def crop_wing(
     """
     from transformers import Sam3Model, Sam3Processor
 
+    model_path = "model_cache/sam3"
+
     device = _resolve_device(device)
     print(f"[crop_wing] Loading SAM3 model on {device} …")
-    model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-    processor = Sam3Processor.from_pretrained("facebook/sam3")
+    model = Sam3Model.from_pretrained(model_path, local_files_only=True).to(device)
+    processor = Sam3Processor.from_pretrained(model_path, local_files_only=True)
 
     try:
         image = Image.open(image_path)
@@ -187,14 +189,24 @@ def segment_wing(
 
     device = _resolve_device(device)
     print(f"[segment_wing] Loading SAM (facebook/sam-vit-huge) on {device} …")
-    generator = pipeline(
-        "mask-generation", model="facebook/sam-vit-huge", device=device
-    )
+    generator = pipeline("mask-generation", model="model_cache/sam", device=device)
 
     try:
         results = generator(cropped_image)
         all_masks = results["masks"]
         print(f"[segment_wing] SAM returned {len(all_masks)} masks total.")
+
+        # Ensure wing_mask matches SAM mask orientation
+        if all_masks:
+            sam_shape = np.asarray(all_masks[0]).shape
+            if wing_mask.shape != sam_shape:
+                if wing_mask.shape == sam_shape[::-1]:
+                    wing_mask = np.ascontiguousarray(wing_mask.T)
+                    print(f"[segment_wing] Transposed wing_mask to {wing_mask.shape}")
+                else:
+                    raise ValueError(
+                        f"wing_mask shape {wing_mask.shape} doesn't match SAM masks {sam_shape}"
+                    )
 
         # ── keep only masks that overlap the wing ──────────────────────
         wing_filtered: list[tuple[np.ndarray, int]] = []
@@ -212,21 +224,20 @@ def segment_wing(
             f"threshold ({overlap_threshold})."
         )
 
-        # ── deduplicate: prefer smaller masks ──────────────────────────
+        # ── deduplicate: prefer smaller masks, subtract overlaps from larger ──
         wing_filtered.sort(key=lambda x: x[1])  # ascending area
         final_masks: list[np.ndarray] = []
 
-        for mask_np, _ in wing_filtered:
-            duplicate = False
+        for mask_np, original_area in wing_filtered:
+            # Subtract all already-kept (smaller) masks from this one
+            remaining = mask_np.copy()
             for kept in final_masks:
-                kept_area = int(kept.sum())
-                if kept_area > 0:
-                    overlap_with_kept = np.logical_and(mask_np, kept).sum() / kept_area
-                    if overlap_with_kept > 0.5:
-                        duplicate = True
-                        break
-            if not duplicate:
-                final_masks.append(mask_np)
+                remaining = np.logical_and(remaining, ~kept)
+
+            remaining_area = int(remaining.sum())
+            # Keep the remainder if it still has significant area (>10% of original)
+            if remaining_area > 0.1 * original_area:
+                final_masks.append(remaining.astype(mask_np.dtype))
 
         print(f"[segment_wing] {len(final_masks)} masks after deduplication.")
         return final_masks
@@ -422,14 +433,101 @@ def run_pipeline(
     }
 
 
+# ── batch processing ────────────────────────────────────────────────────────
+def run_batch(
+    image_paths: list[str],
+    output_dir: str,
+    text_prompt: str = "wing",
+    threshold: float = 0.5,
+    overlap_threshold: float = 0.7,
+    device: str | None = None,
+) -> list[dict]:
+    """Run the pipeline on multiple images.
+
+    Parameters
+    ----------
+    image_paths : list[str]
+        List of paths to input images.
+    output_dir : str
+        Directory where outputs will be saved. For each input image, a cropped
+        image and mask TIFF will be saved using the original filename as a base.
+    text_prompt : str
+        SAM3 text prompt (default ``"wing"``).
+    threshold : float
+        SAM3 detection threshold.
+    overlap_threshold : float
+        Minimum wing-overlap ratio for keeping a SAM mask.
+    device : str | None
+        PyTorch device string.  ``None`` → auto-detect.
+
+    Returns
+    -------
+    list[dict]
+        List of result dictionaries from :func:`run_pipeline`, one per
+        successfully processed image. Failed images are skipped.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    device = _resolve_device(device)
+
+    results = []
+    total = len(image_paths)
+
+    for idx, image_path in enumerate(image_paths, 1):
+        basename = os.path.splitext(os.path.basename(image_path))[0]
+        print(f"\n{'=' * 60}")
+        print(f"[batch] Processing {idx}/{total}: {image_path}")
+        print(f"{'=' * 60}")
+
+        cropped_path = os.path.join(output_dir, f"{basename}_cropped.png")
+        masks_path = os.path.join(output_dir, f"{basename}_masks.ome.tiff")
+
+        result = run_pipeline(
+            image_path,
+            output_cropped_path=cropped_path,
+            output_masks_path=masks_path,
+            text_prompt=text_prompt,
+            threshold=threshold,
+            overlap_threshold=overlap_threshold,
+            visualize=False,
+            device=device,
+        )
+
+        if result is not None:
+            result["source_path"] = image_path
+            results.append(result)
+        else:
+            print(f"[batch] Skipped {image_path} (no wing detected)")
+
+    print(f"\n{'=' * 60}")
+    print(f"[batch] Completed: {len(results)}/{total} images processed successfully")
+    print(f"[batch] Outputs saved to: {output_dir}")
+    print(f"{'=' * 60}")
+
+    return results
+
+
 # ── CLI entry point ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
+    import glob as glob_module
 
     parser = argparse.ArgumentParser(description="Wing crop + segmentation pipeline")
-    parser.add_argument("image", help="Path to the input image")
-    parser.add_argument("--cropped", help="Save cropped wing to this path")
-    parser.add_argument("--masks", help="Save mask OME-TIFF to this path")
+    parser.add_argument(
+        "images",
+        nargs="+",
+        help="Path(s) to input image(s). Supports glob patterns (e.g., 'data/*.jpg')",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "-o",
+        help="Output directory for batch mode. If provided, runs in batch mode.",
+    )
+    parser.add_argument(
+        "--cropped", help="Save cropped wing to this path (single image mode)"
+    )
+    parser.add_argument(
+        "--masks", help="Save mask OME-TIFF to this path (single image mode)"
+    )
     parser.add_argument("--device", default=None, help="cpu | cuda | cuda:0 …")
     parser.add_argument("--prompt", default="wing", help="SAM3 text prompt")
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -437,13 +535,40 @@ if __name__ == "__main__":
     parser.add_argument("--no-viz", action="store_true", help="Disable visualisation")
     args = parser.parse_args()
 
-    run_pipeline(
-        args.image,
-        output_cropped_path=args.cropped,
-        output_masks_path=args.masks,
-        text_prompt=args.prompt,
-        threshold=args.threshold,
-        overlap_threshold=args.overlap,
-        visualize=not args.no_viz,
-        device=args.device,
-    )
+    # Expand glob patterns in image paths
+    expanded_paths = []
+    for pattern in args.images:
+        matches = glob_module.glob(pattern)
+        if matches:
+            expanded_paths.extend(sorted(matches))
+        elif os.path.isfile(pattern):
+            expanded_paths.append(pattern)
+        else:
+            print(f"Warning: '{pattern}' did not match any files")
+
+    if not expanded_paths:
+        parser.error("No valid image files found")
+
+    # Batch mode: multiple images or --output-dir specified
+    if args.output_dir or len(expanded_paths) > 1:
+        output_dir = args.output_dir or "output"
+        run_batch(
+            expanded_paths,
+            output_dir=output_dir,
+            text_prompt=args.prompt,
+            threshold=args.threshold,
+            overlap_threshold=args.overlap,
+            device=args.device,
+        )
+    else:
+        # Single image mode
+        run_pipeline(
+            expanded_paths[0],
+            output_cropped_path=args.cropped,
+            output_masks_path=args.masks,
+            text_prompt=args.prompt,
+            threshold=args.threshold,
+            overlap_threshold=args.overlap,
+            visualize=not args.no_viz,
+            device=args.device,
+        )
